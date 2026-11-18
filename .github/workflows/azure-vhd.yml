@@ -1,0 +1,118 @@
+
+name: AuroraOS - Azure VHD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-vhd:
+    name: Build Azure VHD
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout AuroraOS
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            python3 \
+            qemu-utils
+
+      - name: Build AuroraOS ISO
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Verify boot image
+        run: |
+          test -s aurora.iso
+
+          python3 - <<'PY'
+          with open("aurora.iso", "rb") as f:
+              mbr = f.read(512)
+
+          if len(mbr) != 512:
+              raise SystemExit("Invalid boot image")
+
+          if mbr[510:512] != b"\x55\xaa":
+              raise SystemExit("MBR boot signature missing")
+
+          print("MBR boot signature verified.")
+          PY
+
+      - name: Prepare raw disk image
+        run: |
+          set -euo pipefail
+
+          mkdir -p build artifacts
+
+          cp aurora.iso build/auroraos.raw
+
+          SIZE=$(stat -c%s build/auroraos.raw)
+          ALIGNMENT=1048576
+          ALIGNED=$(( (SIZE + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT ))
+
+          truncate -s "$ALIGNED" build/auroraos.raw
+
+          echo "Raw image size: $ALIGNED bytes"
+
+      - name: Convert to fixed Azure VHD
+        run: |
+          set -euo pipefail
+
+          qemu-img convert \
+            -f raw \
+            -O vpc \
+            -o subformat=fixed,force_size \
+            build/auroraos.raw \
+            artifacts/AuroraOS-Azure-Gen1.vhd
+
+          qemu-img info artifacts/AuroraOS-Azure-Gen1.vhd
+
+      - name: Validate VHD
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import os
+
+          path = "artifacts/AuroraOS-Azure-Gen1.vhd"
+
+          info = json.loads(subprocess.check_output([
+              "qemu-img", "info", "--output=json", path
+          ]))
+
+          size = info["virtual-size"]
+
+          if info["format"] != "vpc":
+              raise SystemExit("Output is not a VHD")
+
+          if size % 1048576 != 0:
+              raise SystemExit("VHD size is not aligned to 1 MiB")
+
+          if os.path.getsize(path) != size + 512:
+              raise SystemExit("Unexpected fixed VHD file size")
+
+          print("Fixed VHD format verified.")
+          print(f"Virtual size: {size} bytes")
+          PY
+
+          cd artifacts
+          sha256sum *.vhd > SHA256SUMS.txt
+
+      - name: Upload Azure VHD
+        uses: actions/upload-artifact@v4
+        with:
+          name: AuroraOS-Azure-VHD
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14

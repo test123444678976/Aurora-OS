@@ -1,4 +1,3 @@
-
 name: AuroraOS - Azure VHD
 
 on:
@@ -34,6 +33,7 @@ jobs:
 
       - name: Verify boot image
         run: |
+          set -euo pipefail
           test -s aurora.iso
 
           python3 - <<'PY'
@@ -52,7 +52,6 @@ jobs:
       - name: Prepare raw disk image
         run: |
           set -euo pipefail
-
           mkdir -p build artifacts
 
           cp aurora.iso build/auroraos.raw
@@ -62,7 +61,6 @@ jobs:
           ALIGNED=$(( (SIZE + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT ))
 
           truncate -s "$ALIGNED" build/auroraos.raw
-
           echo "Raw image size: $ALIGNED bytes"
 
       - name: Convert to fixed Azure VHD
@@ -76,34 +74,48 @@ jobs:
             build/auroraos.raw \
             artifacts/AuroraOS-Azure-Gen1.vhd
 
-          qemu-img info artifacts/AuroraOS-Azure-Gen1.vhd
+          # Specify the format explicitly: automatic probing can classify
+          # a small VHD as raw even when its VHD footer is valid.
+          qemu-img info -f vpc artifacts/AuroraOS-Azure-Gen1.vhd
 
       - name: Validate VHD
         run: |
+          set -euo pipefail
           python3 - <<'PY'
           import json
-          import subprocess
           import os
+          import subprocess
 
           path = "artifacts/AuroraOS-Azure-Gen1.vhd"
+          alignment = 1024 * 1024
 
+          # Explicit -f vpc validates the VHD structure instead of relying
+          # on QEMU's format auto-detection.
           info = json.loads(subprocess.check_output([
-              "qemu-img", "info", "--output=json", path
+              "qemu-img", "info", "-f", "vpc", "--output=json", path
           ]))
+
+          if info["format"] != "vpc":
+              raise SystemExit(f"Expected vpc, got {info['format']}")
 
           size = info["virtual-size"]
 
-          if info["format"] != "vpc":
-              raise SystemExit("Output is not a VHD")
-
-          if size % 1048576 != 0:
-              raise SystemExit("VHD size is not aligned to 1 MiB")
+          if size == 0 or size % alignment != 0:
+              raise SystemExit(f"VHD virtual size is not 1 MiB aligned: {size}")
 
           if os.path.getsize(path) != size + 512:
-              raise SystemExit("Unexpected fixed VHD file size")
+              raise SystemExit("Fixed VHD must contain a 512-byte footer")
 
-          print("Fixed VHD format verified.")
+          with open(path, "rb") as image:
+              image.seek(-512, os.SEEK_END)
+              footer = image.read(512)
+
+          if footer[:8] != b"conectix":
+              raise SystemExit("VHD footer signature is missing")
+
+          print("Fixed VHD structure verified.")
           print(f"Virtual size: {size} bytes")
+          print(f"File size: {os.path.getsize(path)} bytes")
           PY
 
           cd artifacts
@@ -112,7 +124,7 @@ jobs:
       - name: Upload Azure VHD
         uses: actions/upload-artifact@v4
         with:
-          name: AuroraOS-Azure-VHD
+          name: AuroraOS-Azure-Gen1-VHD-candidate
           path: artifacts/
           if-no-files-found: error
           retention-days: 14
